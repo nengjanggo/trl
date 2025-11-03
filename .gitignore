@@ -143,3 +143,8 @@ checklink/cookies.txt
 nbs/wandb/
 examples/notebooks/wandb/
 wandb/
+
+uv.lock
+grpo_trainer_lora_model/
+output/
+unsloth_compiled_cache/

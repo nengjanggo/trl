@@ -30,6 +30,7 @@ _diffusers_available = _is_package_available("diffusers")
 _fastapi_available = _is_package_available("fastapi")
 _is_liger_kernel_available, _liger_kernel_version = _is_package_available("liger_kernel", return_version=True)
 _llm_blender_available = _is_package_available("llm_blender")
+_math_verify_available = _is_package_available("math_verify")
 _mergekit_available = _is_package_available("mergekit")
 _pydantic_available = _is_package_available("pydantic")
 _requests_available = _is_package_available("requests")
@@ -58,6 +59,10 @@ def is_liger_kernel_available(min_version: str = LIGER_KERNEL_MIN_VERSION) -> bo
 
 def is_llm_blender_available() -> bool:
     return _llm_blender_available
+
+
+def is_math_verify_available() -> bool:
+    return _math_verify_available
 
 
 def is_mergekit_available() -> bool:
