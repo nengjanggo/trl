@@ -86,7 +86,7 @@ class TreeRow:
         self.trained = 0
         self.load = 0
         self.node_images: list[Any] = []  # node -> hash of the image its token belongs to, or None
-        self.image_order: list[Any] = []  # image hashes in order of first appearance in the packed row, set by `pack`
+        self.image_order: list[Any] = []  # hash of each image token run, in packed order, set by `pack`
 
     def fits(self, sample: dict[str, Any], budget: int) -> bool:
         """Whether the row stays within `budget` unique tokens and `budget` trained tokens with `sample` added."""
@@ -193,12 +193,15 @@ class TreeRow:
             position_ids = torch.zeros((self.samples[0]["mrope_positions"].shape[0], len(input_ids)), dtype=torch.long)
             for sample, nodes in zip(self.samples, self.sample_nodes, strict=True):
                 position_ids[:, [packed[node] for node in nodes]] = sample["mrope_positions"]
-        # Each image's tokens appear once in the row, in a contiguous run: order the images by where that run starts
-        first = {}
+        # The model fills image tokens run by run with the features of the images it is given, in order. A run never
+        # forks (its tokens and their successors are the same in every sample holding the image), so it is contiguous
+        # in the row; the same image can still recur in several runs, when samples hold it after different prefixes.
+        images = [None] * len(input_ids)
         for node, image in enumerate(self.node_images):
-            if image is not None:
-                first[image] = min(first.get(image, packed[node]), packed[node])
-        self.image_order = sorted(first, key=first.get)
+            images[packed[node]] = image
+        self.image_order = [
+            image for i, image in enumerate(images) if image is not None and (i == 0 or images[i - 1] != image)
+        ]
         shift_labels = [-100] * len(input_ids)
         sampling_mask = [[] for _ in input_ids]
         num_logprobs = max(sample["sampler_ids"].shape[1] for sample in self.samples)

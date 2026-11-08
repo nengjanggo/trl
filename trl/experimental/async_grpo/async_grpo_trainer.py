@@ -251,7 +251,7 @@ def packed_model_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
         "input_ids": inputs["input_ids"][mask_bool].unsqueeze(0),
         "position_ids": position_ids,
         "shift_labels": inputs["shift_labels"][mask_bool].unsqueeze(0),
-        **{key: inputs[key] for key in ("pixel_values", "image_grid_thw") if key in inputs},
+        **{key: inputs[key][0] for key in ("pixel_values", "image_grid_thw") if key in inputs},
         **unpad_tree(inputs),
     }
 
@@ -595,8 +595,9 @@ class DataCollatorForRollout(DataCollatorMixin):
             # Pixel rows have no batch dimension to scatter across ranks, so images need a single rank
             if len(rows) != 1:
                 raise ValueError("Packing images supports a single training process.")
-            batch["pixel_values"] = torch.cat([pixel_values[image] for image in rows[0].image_order])
-            batch["image_grid_thw"] = torch.stack([image_grid_thw[image] for image in rows[0].image_order])
+            # A leading row dimension, like every other field, so the dataloader's per-rank slicing keeps them whole
+            batch["pixel_values"] = torch.cat([pixel_values[image] for image in rows[0].image_order])[None]
+            batch["image_grid_thw"] = torch.stack([image_grid_thw[image] for image in rows[0].image_order])[None]
 
         all_examples = [example for row in rows for example in row.samples]
         self.groups_trained.update(example["group_id"] for example in all_examples)
@@ -1707,14 +1708,18 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # `training_step`. The counts are batch-wide (the collator broadcasts one value per rank), so they are read off
         # rank-local inputs without a collective. Sample rewards and packing metrics are NOT gathered here — rank 0
         # already logged them in the collator.
+        self._account_micro_batch(inputs, self._last_forward_time_s)
+        return loss
+
+    def _account_micro_batch(self, inputs: dict[str, torch.Tensor], forward_s: float) -> None:
+        """Add one micro-batch's token, sample and forward-time counts to the optimizer step's accounting."""
         n_forward_tokens = float(inputs["global_n_forward_tokens"][0])
         mean_seq_len = float(inputs["mean_seq_len"][0])
         self._step_forward_tokens += n_forward_tokens
-        self._step_trained_tokens += float(global_n_tokens)
+        self._step_trained_tokens += float(inputs["global_n_tokens"][0])
         self._step_seq_len_weighted += mean_seq_len * n_forward_tokens
         self._step_samples += n_forward_tokens / mean_seq_len
-        self._step_forward_s += self._last_forward_time_s
-        return loss
+        self._step_forward_s += forward_s
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
