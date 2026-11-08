@@ -15,6 +15,8 @@
 
 import contextvars
 import copy
+import hashlib
+import io
 import itertools
 import json
 import math
@@ -58,7 +60,7 @@ from ...trainer.utils import (
 )
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutLoop, AsyncRolloutWorker, RolloutSample
-from .packing import TREE_ATTENTION, TreeRow, patch_tree_gdn, register_tree_attention, unpad_tree
+from .packing import TREE_ATTENTION, TreeRow, image_tree_ids, patch_tree_gdn, register_tree_attention, unpad_tree
 from .vllm_client import VLLMClient
 from .weight_transfer import WeightTransferClient
 
@@ -233,6 +235,27 @@ def log_rollout_traces(samples: list[RolloutSample], step: int, report_to: list[
         logger.warning(f"rollout trace logging skipped: {type(e).__name__}: {e}")
 
 
+def packed_model_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """
+    The model's forward kwargs for this rank's collated, tree-packed row: tokens, positions and next-token labels with
+    the inter-rank padding stripped, the tree the attention and recurrent kernels follow, and the images of a
+    vision-language row. Call the model with them and `fused_lm_head=True`; `outputs.log_probs.flatten()` at
+    `inputs["token_index"]` are then the trained tokens' log-probabilities.
+    """
+    mask_bool = inputs["attention_mask"].bool()
+    if inputs["position_ids"].dim() == 3:  # vision-language row: (B, 4, N) -> (4, 1, n)
+        position_ids = inputs["position_ids"].transpose(0, 1)[:, mask_bool].unsqueeze(1)
+    else:
+        position_ids = inputs["position_ids"][mask_bool].unsqueeze(0)
+    return {
+        "input_ids": inputs["input_ids"][mask_bool].unsqueeze(0),
+        "position_ids": position_ids,
+        "shift_labels": inputs["shift_labels"][mask_bool].unsqueeze(0),
+        **{key: inputs[key] for key in ("pixel_values", "image_grid_thw") if key in inputs},
+        **unpad_tree(inputs),
+    }
+
+
 class RolloutQueueDataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
@@ -245,8 +268,11 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
         max_staleness=3,
         poll_interval_s=5.0,
         report_to=None,
+        image_token_id=None,
     ):
         self.queue = rollout_queue
+        # Vision-language model: image token id, so a sample's image tokens can be keyed by their image when packed
+        self.image_token_id = image_token_id
         self.model_version_fn = model_version_fn
         self.check_health_fn = check_health_fn
         self.stale_after_s = stale_after_s
@@ -336,7 +362,16 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                     self._trace_buf = []
                     self._last_traced_version = version
 
+            images = {}
+            if sample.images:
+                image_hashes = [hashlib.blake2b(image, digest_size=8).hexdigest() for image in sample.images]
+                images = {
+                    "images": sample.images,
+                    "image_hashes": image_hashes,
+                    "tree_ids": image_tree_ids(sample.input_ids.tolist(), self.image_token_id, image_hashes),
+                }
             yield {
+                **images,
                 "input_ids": sample.input_ids,
                 "completion_mask": sample.completion_mask,
                 "old_log_probs": sample.old_log_probs,
@@ -532,12 +567,19 @@ class DataCollatorForRollout(DataCollatorMixin):
     metrics: dict[str, list] = field(default_factory=lambda: defaultdict(list))
     # Per-row token cap of the planner,
     token_budget: int = 0
+    # Vision-language model: the image processor, the image token id and the model's multimodal position function
+    # (`get_rope_index`). Each micro-batch's distinct images are encoded once; every sample gets its multimodal
+    # positions, which `TreeRow.pack` lays onto the trie.
+    image_processor: Any = None
+    image_token_id: int | None = None
+    rope_index_fn: Callable | None = None
 
     def torch_call(self, examples: list[Any]) -> dict[str, Any]:
         # The dataloader uses batch_size=1 over a planner that pre-partitions each micro-batch into `num_processes`
         # rows, so `examples` is a length-1 list holding that single micro-batch (one row per rank).
         (rows,) = examples
 
+        pixel_values, image_grid_thw = self._prepare_images(rows) if self.rope_index_fn is not None else ({}, {})
         packed = [row.pack() for row in rows]
         padding = {
             "input_ids": self.pad_token_id,
@@ -549,6 +591,12 @@ class DataCollatorForRollout(DataCollatorMixin):
         }
         batch = {key: pad([p[key] for p in packed], padding_value=padding.get(key, 0)) for key in packed[0]}
         batch["attention_mask"] = pad([torch.ones_like(p["input_ids"]) for p in packed], padding_value=0)
+        if pixel_values:
+            # Pixel rows have no batch dimension to scatter across ranks, so images need a single rank
+            if len(rows) != 1:
+                raise ValueError("Packing images supports a single training process.")
+            batch["pixel_values"] = torch.cat([pixel_values[image] for image in rows[0].image_order])
+            batch["image_grid_thw"] = torch.stack([image_grid_thw[image] for image in rows[0].image_order])
 
         all_examples = [example for row in rows for example in row.samples]
         self.groups_trained.update(example["group_id"] for example in all_examples)
@@ -562,6 +610,34 @@ class DataCollatorForRollout(DataCollatorMixin):
 
         self._log_metrics(rows=rows, all_examples=all_examples, padded=batch["attention_mask"])
         return batch
+
+    def _prepare_images(self, rows: list[TreeRow]) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Encode the micro-batch's distinct images once, and give every sample its multimodal positions.
+
+        Returns:
+            `tuple[dict, dict]`: pixel rows and grid of each image hash.
+        """
+        from PIL import Image
+
+        samples = [sample for row in rows for sample in row.samples]
+        images = {h: image for s in samples for h, image in zip(s.get("image_hashes", []), s.get("images", []), strict=True)}
+        pixel_values, image_grid_thw = {}, {}
+        if images:
+            out = self.image_processor(images=[Image.open(io.BytesIO(image)) for image in images.values()], return_tensors="pt")
+            sizes = out["image_grid_thw"].prod(-1).tolist()
+            pixel_values = dict(zip(images, out["pixel_values"].split(sizes), strict=True))
+            image_grid_thw = dict(zip(images, out["image_grid_thw"], strict=True))
+        for sample in samples:
+            input_ids = torch.as_tensor(sample["input_ids"])[None]  # (1, L)
+            grids = [image_grid_thw[h] for h in sample.get("image_hashes", [])]
+            positions, _ = self.rope_index_fn(
+                input_ids,
+                mm_token_type_ids=(input_ids == self.image_token_id).int(),
+                image_grid_thw=torch.stack(grids) if grids else None,
+            )  # (3, 1, L)
+            # Text position (the trie depth) first, then the three multimodal axes: the layout of a 4-row position_ids
+            sample["mrope_positions"] = torch.cat([torch.arange(input_ids.shape[1])[None], positions[:, 0]])  # (4, L)
+        return pixel_values, image_grid_thw
 
     def _log_metrics(self, rows: list[TreeRow], all_examples: list[dict[str, Any]], padded: torch.Tensor) -> None:
         """Append this micro-batch's sample and packing metrics straight into the trainer's sink.
@@ -1095,6 +1171,19 @@ class AsyncGRPOTrainer(_BaseTrainer):
             model.requires_grad_(False)
             text_model.requires_grad_(True)
             model.get_output_embeddings().requires_grad_(True)
+            # Tree packing applies to the text model only; the vision tower encodes each image on its own
+            model.set_attn_implementation({"text_config": TREE_ATTENTION, "vision_config": "sdpa"})
+            # Image inputs: the processor that re-encodes rollout images, and the multimodal position function. Taken
+            # before PEFT wraps the model; `get_rope_index` reads only the config, so it runs on CPU in the collator.
+            from transformers import AutoProcessor
+
+            self.image_processor = AutoProcessor.from_pretrained(
+                get_config_model_id(model.config), trust_remote_code=args.trust_remote_code
+            ).image_processor
+            self.image_token_id = model.config.image_token_id
+            self.rope_index_fn = model.model.get_rope_index
+        else:
+            self.image_processor = self.image_token_id = self.rope_index_fn = None
 
         add_fused_lm_head(model, temperature=self.temperature, outputs=("log_probs", "entropy"))
 
@@ -1375,6 +1464,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 dropped_groups=self._dropped_groups,
                 max_staleness=self.args.max_staleness,
                 report_to=self.args.report_to,
+                image_token_id=self.image_token_id,
             )
             # Kept so `_log_step_metrics` can flush the queue wait at the optimizer-step boundary, which is the only
             # place that knows a step's worth of waiting is over.
@@ -1412,6 +1502,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     # `or 0` because only rank 0 fills an unset budget from the vLLM server above; the other ranks
                     # construct the collator (and never use it) while `token_budget` is still `None`.
                     token_budget=max(self.args.token_budget or 0, 0),
+                    image_processor=self.image_processor,
+                    image_token_id=self.image_token_id,
+                    rope_index_fn=self.rope_index_fn,
                 ),
                 num_workers=0,
                 # NOTE(@aminediro):
@@ -1446,14 +1539,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "tree_segment_parents",
                 "tree_segment_depths",
                 "tree_sizes",
+                "pixel_values",
+                "image_grid_thw",
             ]
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         mask_bool = inputs["attention_mask"].bool()
         selected = inputs["token_index"] >= 0
-        input_ids = inputs["input_ids"][mask_bool].unsqueeze(0)
-        position_ids = inputs["position_ids"][mask_bool].unsqueeze(0)
-        shift_labels = inputs["shift_labels"][mask_bool].unsqueeze(0)
         token_index = inputs["token_index"][selected]
         old_log_probs = inputs["old_log_probs"][selected]
         advantages = inputs["advantages"][selected]
@@ -1476,14 +1568,11 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # MoE models: request router logits so the forward returns the load-balancing loss
         router_kwargs = {"output_router_logits": True} if self.aux_loss_enabled else {}
         outputs = model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            shift_labels=shift_labels,
+            **packed_model_inputs(inputs),
             support_ids=sampling_mask,
             score_ids=sampler_ids,
             fused_lm_head=True,
             **router_kwargs,
-            **unpad_tree(inputs),
         )
         log_probs = outputs.log_probs.flatten()[token_index]
         entropy = outputs.entropy.flatten()[token_index]

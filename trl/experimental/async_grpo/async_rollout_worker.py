@@ -93,6 +93,10 @@ class TurnRecord:
         output_sampler_logprobs (`list[dict[int, float]]`, *optional*):
             One dict per token in `output_ids`: the sampler's log-probabilities of its most likely tokens, keyed by
             token id. Used by score centering (`num_sampler_logprobs`).
+        images (`list[bytes]`, *optional*, defaults to `[]`):
+            Encoded images (e.g. JPEG) of the prompt, in the order their image tokens appear in `prompt_ids`. A
+            vision-language model's training forward re-encodes them, so `prompt_ids` must hold the image tokens
+            already expanded the way the model's processor expands them.
     """
 
     prompt_ids: list[int]
@@ -101,6 +105,7 @@ class TurnRecord:
     output_mask: list[int] | None = None
     output_sampling_mask: list[list[int]] | None = None
     output_sampler_logprobs: list[dict[int, float]] | None = None
+    images: list[bytes] = field(default_factory=list)
 
 
 @dataclass
@@ -113,6 +118,7 @@ class TrainingSequence:
     sampling_mask: list[list[int]]  # per token, the sampler's candidate set; empty for context and without truncation
     sampler_logprobs: list[dict[int, float]]  # per token, the sampler's top log-probs by id; empty when not asked
     rollout_id: RolloutId  # which conversation this row came from
+    images: list[bytes] = field(default_factory=list)  # encoded images of the row, in image-token order
 
 
 def _common_prefix_len(a: list[int], b: list[int], chunk: int = 4096) -> int:
@@ -138,8 +144,11 @@ class _SampleBuilder:
         self.logprobs: list[float] = []
         self.sampling_mask: list[list[int]] = []
         self.sampler_logprobs: list[dict[int, float]] = []
+        self.images: list[bytes] = []
 
     def append_turn(self, turn: TurnRecord) -> None:
+        # A turn extends the row, so its prompt holds every earlier image of the row: its image list is the row's
+        self.images = list(turn.images)
         self._append(turn.prompt_ids[len(self.tokens) :], mask=0)
         self._append(
             turn.output_ids,
@@ -185,6 +194,7 @@ class _SampleBuilder:
             list(self.sampling_mask),
             list(self.sampler_logprobs),
             self.rollout_id,
+            list(self.images),
         )
 
 
@@ -310,6 +320,7 @@ class RolloutSample:
     group_id: int
     metrics: dict[str, float]
     enqueued_at: float | None = None
+    images: list[bytes] = field(default_factory=list)  # encoded images, in image-token order
 
 
 # Env vars the child must drop so accelerate's `PartialState()` initialises in
@@ -1478,6 +1489,7 @@ class AsyncRolloutLoop:
                         model_version=group.model_version,
                         group_id=group.group_id,
                         metrics=dict(metrics),  # own copy per row
+                        images=seq.images,
                     )
                 )
         return samples

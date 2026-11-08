@@ -25,6 +25,36 @@ from transformers.integrations.flash_attention import get_target_dtype
 from transformers.masking_utils import AttentionMaskInterface
 
 
+def image_tree_ids(input_ids: list[int], image_token_id: int, image_hashes: list[Any]) -> list[Any]:
+    """`input_ids` with each image token replaced by `(token, hash of its image)`.
+
+    The image tokens of one image are a contiguous run, and the runs follow the order of `image_hashes`.
+    """
+    ids, image = [], -1
+    for i, token in enumerate(input_ids):
+        if token == image_token_id:
+            image += i == 0 or input_ids[i - 1] != image_token_id
+            ids.append((token, image_hashes[image]))
+        else:
+            ids.append(token)
+    if image != len(image_hashes) - 1:
+        raise ValueError(f"{image + 1} image token runs but {len(image_hashes)} images")
+    return ids
+
+
+def _tree_keys(sample: dict[str, Any]) -> list[tuple[Any, Any]]:
+    """Trie key of each token of `sample`: the token and the next one.
+
+    A vision-language sample carries `tree_ids`, its tokens with every image token replaced by `(token, image hash)`:
+    image tokens are the same id whatever the image, so without the hash two samples that saw different images would
+    share those positions.
+    """
+    ids = sample.get("tree_ids")
+    if ids is None:
+        ids = sample["input_ids"].tolist()
+    return list(zip(ids, [*ids[1:], None], strict=True))
+
+
 class TreeRow:
     """
     One DP rank's forward: its samples folded into a prefix trie, so a token shared by several samples is forwarded
@@ -55,12 +85,14 @@ class TreeRow:
         self.groups: set[Any] = set()
         self.trained = 0
         self.load = 0
+        self.node_images: list[Any] = []  # node -> hash of the image its token belongs to, or None
+        self.image_order: list[Any] = []  # image hashes in order of first appearance in the packed row, set by `pack`
 
     def fits(self, sample: dict[str, Any], budget: int) -> bool:
         """Whether the row stays within `budget` unique tokens and `budget` trained tokens with `sample` added."""
         input_ids = sample["input_ids"].tolist()
         children, shared = self.roots, 0
-        for key in zip(input_ids, [*input_ids[1:], None], strict=True):
+        for key in _tree_keys(sample):
             if key not in children:
                 break
             children = self.children[children[key]]
@@ -72,7 +104,7 @@ class TreeRow:
         """Load `add(sample)` would add to the row: `depth + 1` for each of its tokens not already in the trie."""
         input_ids = sample["input_ids"].tolist()
         children, shared = self.roots, 0
-        for key in zip(input_ids, [*input_ids[1:], None], strict=True):
+        for key in _tree_keys(sample):
             if key not in children:
                 break
             children = self.children[children[key]]
@@ -83,10 +115,11 @@ class TreeRow:
         input_ids = sample["input_ids"].tolist()
         children = self.roots
         nodes = []
-        for depth, key in enumerate(zip(input_ids, [*input_ids[1:], None], strict=True)):
+        for depth, key in enumerate(_tree_keys(sample)):
             if key not in children:
                 children[key] = len(self.tokens)
-                self.tokens.append(key[0])
+                self.tokens.append(input_ids[depth])
+                self.node_images.append(key[0][1] if isinstance(key[0], tuple) else None)
                 self.children.append({})
                 self.load += depth + 1
             nodes.append(children[key])
@@ -107,7 +140,10 @@ class TreeRow:
         Returns:
             `dict[str, torch.Tensor]`, of `N` forwarded tokens, `S` segments and `M` trained tokens:
                 - `input_ids` (`N`): the unique tokens.
-                - `position_ids` (`N`): each token's position in its samples, which is its depth in the trie.
+                - `position_ids` (`N`): each token's position in its samples, which is its depth in the trie. For a
+                  vision-language row whose samples carry `mrope_positions` (`P`, `L`), it is (`P`, `N`): each node
+                  takes the multimodal position its samples give it (equal in every sample sharing the node, since a
+                  shared prefix holds the same tokens and images).
                 - `shift_labels` (`N`): next token each position predicts, `-100` where it is not trained.
                 - `sampling_mask` (`T`), `sampling_mask_counts` (`N`): candidate sets the sampler drew the next tokens
                   from, laid end to end in position order, and the size of each position's set; `T` is `0` without
@@ -152,6 +188,17 @@ class TreeRow:
             stack.extend((child, segment, depth) for child in reversed(self.children[node].values()))
 
         lengths = [end - start for start, end in zip(offsets[:-1], offsets[1:], strict=True)]
+        position_ids = torch.tensor(position_ids)
+        if self.samples[0].get("mrope_positions") is not None:
+            position_ids = torch.zeros((self.samples[0]["mrope_positions"].shape[0], len(input_ids)), dtype=torch.long)
+            for sample, nodes in zip(self.samples, self.sample_nodes, strict=True):
+                position_ids[:, [packed[node] for node in nodes]] = sample["mrope_positions"]
+        # Each image's tokens appear once in the row, in a contiguous run: order the images by where that run starts
+        first = {}
+        for node, image in enumerate(self.node_images):
+            if image is not None:
+                first[image] = min(first.get(image, packed[node]), packed[node])
+        self.image_order = sorted(first, key=first.get)
         shift_labels = [-100] * len(input_ids)
         sampling_mask = [[] for _ in input_ids]
         num_logprobs = max(sample["sampler_ids"].shape[1] for sample in self.samples)
@@ -176,7 +223,7 @@ class TreeRow:
             ]
         return {
             "input_ids": torch.tensor(input_ids),
-            "position_ids": torch.tensor(position_ids),
+            "position_ids": position_ids,
             "shift_labels": torch.tensor(shift_labels),
             "sampling_mask": torch.tensor(list(chain.from_iterable(sampling_mask)), dtype=torch.long),
             "sampling_mask_counts": torch.tensor(list(map(len, sampling_mask))),
@@ -231,6 +278,9 @@ def _flash_attn():
     # FlashAttention-3 has no kernels for Blackwell GPUs (compute capability 10 and above), FlashAttention-4 does
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
         return get_kernel("kernels-community/flash-attn4", version=1)
+    # Nor for Ampere and Ada (compute capability 8), FlashAttention-2 does, with the same varlen interface
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9:
+        return get_kernel("kernels-community/flash-attn2", version=4)
     return get_kernel("kernels-community/flash-attn3", version=1)
 
 
